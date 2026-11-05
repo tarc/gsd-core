@@ -1502,18 +1502,22 @@ Configure GSD settings interactively — workflow toggles, advanced knobs, integ
 
 | Section | Keys |
 |---------|------|
-| Planning Tuning | `workflow.plan_bounce`, `workflow.plan_bounce_passes`, `workflow.plan_bounce_script`, `workflow.subagent_timeout`, `workflow.inline_plan_threshold` |
+| Planning Tuning | `planner.stall_detection_enabled`, `planner.stall_threshold_minutes`, `planner.stall_detect_interval_minutes`, `workflow.plan_bounce`, `workflow.plan_bounce_passes`, `workflow.plan_bounce_script`, `workflow.subagent_timeout`, `workflow.inline_plan_threshold` |
 | Execution Tuning | `workflow.node_repair`, `workflow.node_repair_budget`, `workflow.auto_prune_state` |
 | Discussion Tuning | `workflow.max_discuss_passes` |
 | Cross-AI Execution | `workflow.cross_ai_execution`, `workflow.cross_ai_command`, `workflow.cross_ai_timeout` |
 | Git Customization | `git.base_branch`, `git.phase_branch_template`, `git.milestone_branch_template` |
 | Runtime / Output | `response_language`, `context_window`, `search_gitignored`, `graphify.build_timeout` |
+| Runtime Model Tiers | `runtime`, `model_profile_overrides.<runtime>.opus`, `model_profile_overrides.<runtime>.sonnet`, `model_profile_overrides.<runtime>.haiku` |
+| Model Policy | `model_policy.provider`, `model_policy.budget`, `model_policy.high`, `model_policy.medium`, `model_policy.low` |
+
+The planner stall threshold and check interval are asked only while `planner.stall_detection_enabled` is `true`; both take whole minutes, minimum `1`, defaults `10` and `5`.
 
 All answers merge via `gsd-tools query config-set`, preserving unrelated keys. API keys are masked (`****<last-4>`) in all output.
 
 ```bash
 /gsd-config                         # Common-case interactive config
-/gsd-config --advanced              # Power-user knobs (six-section prompt)
+/gsd-config --advanced              # Power-user knobs (eight-section prompt)
 /gsd-config --integrations          # API keys, review CLI routing, agent skills
 /gsd-config --profile budget        # Switch to budget profile
 /gsd-config --profile quality       # Switch to quality profile
@@ -1780,8 +1784,8 @@ Review source files changed during a phase for bugs, security vulnerabilities, a
 | `--depth=quick\|standard\|deep` | No | Review depth level. Overrides both `workflow.code_review_depth` and any matching `workflow.code_review_depth_overrides` path rule — the flag always wins. `quick`: pattern-matching only (~2 min). `standard`: per-file analysis with language-specific checks (~5–15 min, default). `deep`: cross-file analysis including import graphs and call chains (~15–30 min) |
 | `--files file1,file2,...` | No | Explicit comma-separated file list; skips SUMMARY/git scoping entirely |
 | `--fix` | No | Auto-fix issues after review — reads REVIEW.md, spawns fixer agent, commits each fix atomically |
-| `--fix --all` | No | Include Info findings in fix scope (default: Critical + Warning only) |
-| `--fix --auto` | No | Fix + re-review iteration loop, capped at 3 iterations |
+| `--fix --all` | No | Include Info and necessity findings in fix scope (default: Critical + Warning, excluding necessity findings). Necessity findings are fixed last, by removing code, and are marked for human verification |
+| `--fix --auto` | No | Fix + re-review iteration loop, capped at 3 iterations. Stops early when the fixer reports no findings left in its scope, leaving out-of-scope findings in `REVIEW.md` |
 | *(reviewer-lane flag)* | No | Any flag `gsd_run review-lane flags` reports for the installed roster (e.g. `--codex`, `--agy`) — see below |
 
 **Prerequisites:** Phase has been executed and has SUMMARY.md or git history

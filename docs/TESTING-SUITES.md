@@ -530,10 +530,20 @@ only supported runtime.
 |---|---|---|---|
 | `test` | `ubuntu-latest` (1 targeted + 3-shard full) | `product_changed == 'true'` | The default, always-scoped PR signal — the full `unit`/`integration`/`security` suites run once, sharded, on Linux. **Linux only**: its three `scope: windows` shards were deleted in #4641 (ADR-4641), which found them a second, redundant Windows selector alongside `test-conformance` |
 | `test-inert` | `ubuntu-latest` | `code_changed == 'true' && product_changed != 'true'` | A lightweight lane for PRs that touch only CI YAML (every `.github/**/*.yml\|*.yaml` file: workflows, composite actions, dependabot and issue-form config; code changed, but nothing that needs the real matrix). Since #6075 `classify()` reports `code_changed=true`, `product_changed=false`, `full_matrix=false` for these and targets only the workflow-lint tests; the full matrix never runs for a CI-YAML-only PR |
-| `test-conformance` | `windows-latest` (3-shard) + `macos-latest` (unsharded) | `code_changed == 'true' && full_matrix == 'true'`, and — only while the repo variable `GSD_PR_LINUX_ONLY` is `true` — on a `pull_request` also the `full-matrix` label (#5604; a label added after a run started does not re-run it — push a commit or dispatch the branch) | Runs only the **platform-conformance-tier** file list (`scripts/lib/platform-conformance-tier.generated.cjs`, epic #4589 Phase 2/#4591) on real Windows/macOS — since #4641 the **sole** Windows and macOS selector in CI, not merely the sole gating one. Retired the parallel legacy full-suite matrix in #4603; #4641 removed the second Windows selector in `test` and narrowed the tier from 548 to 266 of 932 eligible unit-suite files (58.8% → 28.5%, measured 2026-09-11; the absolute counts track `next`'s test count, the percentages are what the ceiling test binds on). |
+| `test-conformance` | `windows-latest` (6-shard) + `macos-latest` (3-shard) | `code_changed == 'true' && full_matrix == 'true'`, and — only while the repo variable `GSD_PR_LINUX_ONLY` is `true` — on a `pull_request` also the `full-matrix` label (#5604; a label added after a run started does not re-run it — push a commit or dispatch the branch) | Runs only the **platform-conformance-tier** file list (`scripts/lib/platform-conformance-tier.generated.cjs`, epic #4589 Phase 2/#4591) on real Windows/macOS — since #4641 the **sole** Windows and macOS selector in CI, not merely the sole gating one. Retired the parallel legacy full-suite matrix in #4603; #4641 removed the second Windows selector in `test` and narrowed the tier from 548 to 266 of 932 eligible unit-suite files (58.8% → 28.5%, measured 2026-09-11; the absolute counts track `next`'s test count, the percentages are what the ceiling test binds on). |
 | `coverage-gate` | `ubuntu-latest` | `product_changed == 'true' && test.result == 'success'` | Merges every `test` shard's coverage dumps and evaluates the threshold once (sharding moved this out of the `test` job itself — #2952) |
 | `qa-loop-walk` | `ubuntu-latest` | `product_changed == 'true'` | The QA smell-ratchet scenario walk (see "The QA smell ratchet" below) |
 | `required-tests` | `ubuntu-latest` | `always()` | Aggregates every job above into the one branch-protection-required check |
+
+The `Tests` workflow does not run on label events (#6076), so a label change
+never spends the matrix or cancels a run in flight. The one exception is a
+separate workflow, `fix-next re-run` (`.github/workflows/fix-next-rerun.yml`):
+when `fix-next` is added or removed it re-runs only the `Base branch health`
+job of the PR's latest `Tests` run (and so its dependent `Required tests`),
+reading the label from the API. It skips when the run was cancelled or the PR
+head has since moved. Logic and tests: `scripts/ci-fix-next-rerun.cjs`,
+`tests/ci-fix-next-rerun.test.cjs`. A `Tests` run that started before #6076
+merged ignores the API label; push a commit after applying `fix-next`.
 
 `full_matrix` fires on any changed `tests/**/*.test.cjs` file unconditionally (restored
 by #4421 after #962's narrowing let a real regression through undetected), plus a
@@ -582,7 +592,7 @@ mis-ranked files badly enough that the slowest chunk ran ~3.9x the lightest.
 | `RUN_TESTS_TIMINGS_FILE` | `tests/test-timings.json` | Path to the timing table. Tests override it to inject a synthetic cost profile. |
 | `RUN_TESTS_PLATFORM_TIMINGS_FILE` | `tests/test-timings.<platform>.json` | Path to the table measured on the platform the runner is on (`process.platform` spelling: `win32`, `darwin`, `linux`). Only `tests/test-timings.win32.json` is committed. When `RUN_TESTS_TIMINGS_FILE` is overridden and this variable is not, no platform table is loaded, so an injected cost profile is used exactly as given. |
 | `RUN_TESTS_TIMING_EVENTS_FILE` | unset | When set, every chunk appends its per-file `test:summary` durations to this file (the input `gen-test-timings.cjs` reads). Written after every chunk, including failed and killed ones. The runner removes the variable from its own environment before spawning chunks, so a nested `run-tests.cjs` never writes to it. A write failure prints one warning and never changes the exit code. |
-| `GSD_SEAM_SPAWN_LOG_FILE` | set by the runner to the `RUN_TESTS_TIMING_EVENTS_FILE` path | Read by `tests/helpers/process-seam.cjs`: a spawn that took `GSD_SEAM_SLOW_SPAWN_MS` (default 2000) or longer, or was killed, appends one `seam:spawn-stall` line to this file. See [Read CI timeout signals](how-to/read-ci-timeout-signals.md). |
+| `GSD_SEAM_SPAWN_LOG_FILE` | set by the runner to the `RUN_TESTS_TIMING_EVENTS_FILE` path | Read by `tests/helpers/process-seam.cjs`: a spawn that took `GSD_SEAM_SLOW_SPAWN_MS` (default 2000) or longer, was killed, or used at least half of its own timeout, appends one `seam:spawn-stall` line to this file. See [Read CI timeout signals](how-to/read-ci-timeout-signals.md). |
 | `RUN_TESTS_CHUNK_TIMEOUT_MS` | `600000` | Per-chunk timeout. When it fires, the runner kills the chunk (on Windows it first attempts a whole-tree kill) and prints the in-flight-file diagnostic immediately, without waiting for the child's exit to be reported. |
 | `RUN_TESTS_CHUNK_KILL_GRACE_MS` | `30000` | Once a chunk times out, how long the runner waits for the child's exit to be observed before it stops waiting, reports that the exit was never confirmed, and aborts the remaining chunks. |
 
@@ -639,14 +649,32 @@ hand-measured cost for that job — now all three of the jobs above, not just
 
 `test-conformance` in `test.yml` (#4591, epic #4589 Phase 2) runs the
 `scripts/lib/platform-conformance-tier.generated.cjs` file list on
-`windows-latest` (sharded three ways) and `macos-latest` (unsharded) — the
-sole gating signal for real-OS coverage (#4603 retired the parallel
-legacy full-matrix safety-net job). It
-also declares a `timeout-minutes` cap and runs the same in-job near-cap check
-described below, but it has no `LANE_COSTS` entry in
-`tests/ci-test-job-timeout-budget.test.cjs` yet — no real, completed
-(non-cancelled) per-shard measurement exists — so the headroom-factor gate
-does not cover it until one lands.
+`windows-latest` and `macos-latest`, both sharded since #5029 (the `shard:`
+rows of the job's matrix in `test.yml` are the one statement of the counts) —
+the sole gating signal for real-OS coverage (#4603 retired the parallel legacy
+full-matrix safety-net job). It also declares a `timeout-minutes` cap and runs
+the same in-job near-cap check described below. Since #5029 it **is** covered
+by the headroom-factor gate. One cap covers every matrix row, so its
+`LANE_COSTS` entry is the slowest row, windows or macOS shard. That entry, in
+`tests/ci-test-job-timeout-budget.test.cjs`, is the one place the lane's
+measurements are recorded: the long pole per layout, why each OS is split the
+way it is (a slow macOS runner took the unsharded row past what the gate
+admits), and the figure the cap may not drop below. It had been uncovered
+since #4591, which is how it drifted to a 34m long pole against a 45m cap and
+began cancelling shards whose every chunk passed (#4935). The same file also
+projects the Windows rows' worst shard from the shard count `test.yml`
+declares and the current tier size, at the slow-runner skew #5029's triage
+measured, and fails when that shard would land in the near-cap band. At the
+tier size #5029 merged with, it fails at the layout #5029 replaced and passes
+at the one `test.yml` declares; the comment on the model says how far that
+verdict depends on the fit.
+
+#5071 → #5097 has since priced win32 files by win32 measurements, which evened
+out the shards. Whenever this lane is resharded again, in either direction,
+re-measure from the new runs and set the entry from the slowest row; never
+scale the existing figure. The per-shard balance check (`SHARD_BALANCE`, see
+[Read CI timeout signals](how-to/read-ci-timeout-signals.md)) must then be
+re-baselined too; a test fails until it is.
 
 **`.platform.test.cjs` siblings (#5074).** The tier selects whole files, so a large file whose
 platform signal sits in a few tests can be split: those tests move to

@@ -4,8 +4,9 @@ Every matrixed CI job (`test`, `test-conformance` in `.github/workflows/test.yml
 `mutate` in `mutation.yml`; `smoke` in `install-smoke.yml`) now reports how close it ran to its
 `timeout-minutes` cap. This page is for a maintainer trying to answer: *is a lane drifting
 toward its cap, and where do I look?* (`test-conformance` runs the platform-conformance-tier file
-list — `scripts/lib/platform-conformance-tier.generated.cjs` — on `windows-latest`, sharded three
-ways, and `macos-latest`, unsharded; it is the sole gating signal for real-OS coverage.)
+list — `scripts/lib/platform-conformance-tier.generated.cjs` — on `windows-latest` and
+`macos-latest`, each sharded as the job's matrix in `test.yml` declares; it is the sole gating
+signal for real-OS coverage.)
 
 ## 1. A single run crossed 90% of its budget
 
@@ -63,7 +64,14 @@ cap. That is a maintainer call among three options, each with real tradeoffs:
 - **Raise the `timeout-minutes` cap** for that job.
 - **Rebalance the shard split** so no single shard carries a disproportionate share of the
   suite (see `scripts/run-tests.cjs`'s `selectShard`, which packs shards by measured cost from
-  `tests/test-timings.json`).
+  `tests/test-timings.json`, and on win32 from `tests/test-timings.win32.json` via
+  `makeFileWeigher`'s `platformTimings` arm — #5071/#5097). **Never read a balanced packing as a
+  balanced runtime:** LPT balances in its own weight units by construction, so it reports a
+  perfect split whatever the real durations are. To see the truth, score each shard by summing
+  its files' durations from a measured table for that platform. Before #5097 the Windows lane
+  was the cautionary case — shards the packer scored identically ran 0.75x / 1.21x / 1.04x of an
+  equal split (#5029) — and with win32 measurements in place that imbalance measures 1.01-1.02,
+  so a long pole on this lane is now a capacity question rather than a mis-pricing one.
 - **Trim what runs on the long-pole shard** — for the `test` job, shard 1 also carries the
   unsharded aux suites (integration/security/install/slow); moving one elsewhere changes what
   shard 1 costs.
@@ -87,9 +95,14 @@ shard cancelled after it ran (killed at its cap) counts.
 
 **What it checks.**
 
-- The gap between the slowest and fastest shard's median must be at most 2 minutes.
-- No shard's p90 may be above its baseline: shard 1/3 30.4 min, shard 2/3 34.1 min, shard 3/3
-  36.8 min.
+- The gap between the slowest and fastest shard's median must be at most `maxMedianGapMs`.
+- No shard's p90 may be above its entry in `baselineP90Ms`.
+
+Both values live only in `SHARD_BALANCE`, with the runs they were measured on, how each was
+derived and the margin later runs leave, in the comment above them; this page deliberately does
+not copy them. Since #5029 they describe the layout `baselineShardTotal` names. The gap limit is
+deliberately wider than the 2 minutes #5101 set for the ~30-minute shards of its day: on shorter
+shards a single long test file moves one shard by minutes on its own.
 
 **Where you see it.** Every run writes a table to the `shard-balance` step's summary. A breach, or
 a baseline mismatch, also opens an issue titled **CI: Windows conformance shard balance
@@ -98,11 +111,17 @@ until someone closes it.
 
 | Status | What it means | What to do |
 |---|---|---|
-| `insufficient-data` | Fewer than 10 qualifying runs so far, or fewer than two shards have data. | Nothing. It reports once enough `next` pushes land. |
+| `insufficient-data` | Fewer than `minRuns` qualifying runs so far, or fewer than two shards have data. Also right after a re-shard merges: the newest runs still use the old layout while the baseline's layout has fewer than `minRuns` runs. | Nothing. It reports once enough `next` pushes land. |
 | `ok` | Both criteria hold. | Nothing. |
-| `breach` | The median gap is over 2 minutes, or a shard's p90 is over its baseline. The issue lists which. | Regenerate the win32 timing table ([Regenerate the win32 timing table](regenerate-the-win32-timing-table.md)). A new heavy conformance file, or a stale table, is the usual cause. If the gap persists with a fresh table, look at per-chunk overhead: the shard with more, smaller chunks pays more process startup. |
-| `baseline-mismatch` | The newest run's Windows shard count differs from the baseline's (3). The lane was re-sharded. | Measure the new layout and update `baselineShardTotal` and `baselineP90Ms` in `SHARD_BALANCE`. Until then, no gap or p90 verdict is given. |
+| `breach` | The median gap is over `maxMedianGapMs`, or a shard's p90 is over its baseline. The issue lists which. | First find which kind of cost moved. In the slow shard's log, compare the `run-tests: chunk N/M completed in Xms` lines with a fast shard's. **One chunk far longer than the rest** means a single long test file sets that chunk's wall time (a chunk cannot finish before its longest file), and regenerating the timing table will not help; the fix is splitting that file, or packing that accounts for it. **Every chunk uniformly slower** across the run means a slow runner; wait for more runs. **The shard's chunks are all heavier than another shard's** points at weights: regenerate the win32 timing table ([Regenerate the win32 timing table](regenerate-the-win32-timing-table.md)), since a new heavy conformance file or a stale table mis-prices the split. |
+| `baseline-mismatch` | The newest run's Windows shard count differs from `baselineShardTotal`, and the baseline's layout has at least `minRuns` runs. The lane was re-sharded away from it. | Measure the new layout and update `baselineShardTotal` and `baselineP90Ms` in `SHARD_BALANCE`. Until then, no gap or p90 verdict is given. A re-shard PR should already fail `tests/ci-timeout-report.test.cjs`, which checks this count against `test.yml`. |
 | `error` | The GitHub API could not be read. The step logs a warning. | Re-run the workflow once the API is reachable. The per-job report step is unaffected. |
+
+The check reads the newest 40 runs (twice `windowRuns`). So `baseline-mismatch` needs at least
+`minRuns` of those to be baseline-layout runs: once they age out, a lane that really did move
+reads `insufficient-data` and never `baseline-mismatch`. An issue already opened stays open, but
+if `insufficient-data` lasts past `minRuns` pushes, compare the newest run's shard count with
+`baselineShardTotal`.
 
 The check never fails the workflow and never changes how shards are packed; it only reports.
 Closing the tracking issue after a fix is up to you. A later breach opens a new one.
@@ -114,7 +133,7 @@ A bounded child that runs to its timeout used to fail as `null !== 0`. Every spa
 slow or killed spawn leaves a line in the uploaded `test-timings-<os>-job<n>` artifact.
 
 1. Open the artifact's `.jsonl` and find lines with `"type":"seam:spawn-stall"`. A spawn is
-   recorded when it took 2 s or longer (`GSD_SEAM_SLOW_SPAWN_MS` changes the bound) or was killed.
+   recorded when it took 2 s or longer (`GSD_SEAM_SLOW_SPAWN_MS` changes the bound), was killed, or used at least half of its own timeout (a near-miss). Every shared bound is 5 s or more, so with the default threshold a near-miss adds no records; it adds the fields below to records already written, and adds records only for a bound under 4 s or a raised `GSD_SEAM_SLOW_SPAWN_MS`. Each record carries `boundFraction` (duration divided by timeout, floored to three decimals) and `nearMiss`. A class creeping toward its bound shows as a rising `boundFraction`.
 2. Read `file` (the test file), `command` and `argv` (first three arguments), `outcome`
    (`timed_out`, `killed`, `exited`), `signal`, `durationMs`, `timeoutMs`, `pid`, and the UTC
    `startedAt`/`endedAt`.
@@ -125,3 +144,28 @@ slow or killed spawn leaves a line in the uploaded `test-timings-<os>-job<n>` ar
 
 Tests that assert on a seam result can use `assertSeamExit(assert, result, 0)`, which names the
 outcome, signal and duration in its failure message, or put `result.summary` in their own message.
+
+## Reproduce the evidence numbers
+
+The CI figures in `tests/helpers/timeouts.cjs` `TIMEOUT_EVIDENCE` (observed max, p50, p99, samples, lanes, unseen sites) come from the `seam:spawn-stall` records above. `scripts/timeout-evidence-from-ci.cjs` recomputes them from the repository and the downloaded artifacts. Downloading is a separate step; the script never contacts the network.
+
+1. List the successful `test.yml` runs of the `push` and `merge_group` events created after the window start, then download each run's timing artifacts into `<dir>/<run id>/`:
+
+   ```sh
+   gh run list --workflow test.yml --event push --status success --created ">=2026-10-25" --limit 400 --json databaseId,createdAt
+   gh run download <run id> --pattern 'test-timings-*' --dir <dir>/<run id>
+   ```
+
+   `2026-10-25` is the window start in `CI_WINDOW` (`tests/helpers/timeouts.cjs`).
+
+   Repeat the list with `--event merge_group`. `gh run download --help` states that when only a single artifact is specified it is extracted into the target directory itself, and otherwise one folder per artifact name is created. The script reads both layouts, `<dir>/<run id>/<artifact name>/*.jsonl` and `<dir>/<run id>/*.jsonl`, and takes the platform from the artifact folder name or, failing that, the file name (`ubuntu`, `windows` or `macos`). It exits 2 when it finds no lane file or a lane whose platform it cannot determine. Expired artifacts cannot be downloaded and are skipped.
+
+2. Run the script from the repository root:
+
+   ```sh
+   node scripts/timeout-evidence-from-ci.cjs --artifacts <dir> --format md
+   ```
+
+   `--format json` prints the full figures, and `--repo <root>` points it at another checkout. `--raw-sites` prints the call sites that spawn outside the process seam, grouped by constant, as `- [ ] tests/x.test.cjs:LINE (CONSTANT)` lines.
+
+A record is credited to a constant by call site: the record's test file (or a helper it requires) has a seam call site of that constant, the record's `timeoutMs` equals the constant's value, and its command matches the site's callee. A site reached only through a shared helper must also show one of its own string literals in the record's argv, otherwise the record stays unmatched. A record that still matches two constants after narrowing by argv is credited to neither and counted as ambiguous. The script reports any call site it could not classify (`unresolvedSites`) and any manual resolution that matched nothing (`unusedResolutions`); resolve either in `MANUAL_RESOLUTIONS` in the script.

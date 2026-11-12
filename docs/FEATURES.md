@@ -181,6 +181,8 @@
   - [Spec-Phase Prohibition Probe](#146-spec-phase-prohibition-probe)
   - [Capability Management Command](#147-capability-management-command)
   - [Smart Entry Launcher](#148-smart-entry-launcher)
+  - [Criterion Baseline Notation](#4309-criterion-baseline-notation)
+  - [Criterion Baseline Replay](#4310-criterion-baseline-replay)
 - [v1.7.0 Features](#v170-features)
   - [Embeddable Orchestration System (Host-Integration Interface)](#149-embeddable-orchestration-system-host-integration-interface)
   - [Discoverability Registries](#150-discoverability-registries)
@@ -213,6 +215,7 @@
   - [Reachable Lint Rules and a Non-Destructive Quick-Task Append](#3951-reachable-lint-rules-and-a-non-destructive-quick-task-append)
   - [Per-Task External-Tracker Content-Resolution Seam](#3970-per-task-external-tracker-content-resolution-seam)
   - [Unreadable-Directory Scope Signal](#4014-unreadable-directory-scope-signal)
+  - [Project Exemptions for the Secret-Read Guard](#4432-project-exemptions-for-the-secret-read-guard)
   - [Graphify CLI Preferred for Planner and Researcher Graph Queries](#4836-graphify-cli-preferred-for-planner-and-researcher-graph-queries)
   - [Gate Evidence and Verdict-Driven Exit Status](#5170-gate-evidence-and-verdict-driven-exit-status)
 
@@ -3769,6 +3772,54 @@ The load-bearing wire is the `plan-phase` lift into `must_haves.prohibitions`, s
 
 **Reference:** [Smart Entry Design](superpowers/specs/2026-06-27-gsd-smart-entry-design.md)
 
+---
+
+### 4309. Criterion Baseline Notation
+
+**Command:** `gsd-tools verify plan-structure <PLAN.md>` (run by `/gsd-plan-phase`'s plan checker)
+
+**Purpose:** Catch a quantitative acceptance criterion that is already true before any work happens. Such a criterion passes whether or not the task runs, so it verifies nothing. The planner records each count/match gate's measured baseline beside it, and `verify plan-structure` checks that the gate can fail.
+
+**Notation:**
+
+```
+[HEAD=<value> EXPECT<op><value> [@<sha>] [GUARD MUTATION: <ref>] [UNPINNED]]
+value ∈ <integer> | absent | present | error:<exit-code>      op ∈ == != >= > <= <
+```
+
+`HEAD` is what the command prints now, and `EXPECT` is what it must print after the change. A `grep -c` over a missing file is `error:2`, not `0`.
+
+**Behavior:**
+
+| Rule | Severity | Fires when |
+|---|---|---|
+| B1 | error | `HEAD` already satisfies `EXPECT` and the notation lacks `GUARD MUTATION: <ref>`; the plan is invalid |
+| B2 | warning | a legacy free-form `# baseline at HEAD:` comment sits in a criteria zone |
+
+A notation the checker cannot parse or evaluate is a status in `baseline_statuses` and never changes the exit code. Nothing is executed. The JSON verdict adds `baseline_notation_count`, `baseline_findings` and `baseline_statuses`. The exit is `<!-- plan-criteria-allow: B1 - <reason> -->`.
+
+**Reference:** [PLAN.md → Baseline notation](reference/plan-md.md#baseline-notation) · [Resolve baseline-notation findings](how-to/resolve-baseline-notation-findings.md) · [ADR-4309](adr/4309-criterion-baseline-notation.md)
+
+---
+
+### 4310. Criterion Baseline Replay
+
+**Command:** `gsd-tools verify plan-structure <PLAN.md> --replay` (opt-in, run by hand)
+
+**Purpose:** Check that a recorded baseline was measured, not guessed. `[HEAD=2 EXPECT>=3]` claims the command printed 2 before the work. Replay runs the command and reports a mismatch when it prints something else. Without it, a wrong baseline surfaces only when the executor runs the phase.
+
+**How it works:**
+- The command is the backtick span before the notation, or the text before the trailing `#` of an `<automated>` command.
+- It runs as direct argv with no shell, from the project root.
+- Only `grep`, and `git` with `grep`, `ls-files`, `rev-parse` or `rev-list`, may run. Anything else is a `disallowed` status and does not run.
+- Each command gets 10 s and 64 KiB of output. A run replays at most 50 commands within 60 s.
+
+**Output:** a `replay` key, `{ head_sha, results, mismatch_count, statuses }`. Results carry the recorded and observed values, never the raw output.
+
+**Advisory only:** a mismatch is a warning and a status changes nothing. The exit code and `valid` come from the static rules alone.
+
+**Docs:** [How to check recorded baselines by replaying them](how-to/replay-recorded-baselines.md) · [ADR-4310](adr/4310-criterion-replay.md)
+
 
 ---
 
@@ -4702,6 +4753,30 @@ phase directory.
   path for the rest of their output — an intentional, additive-only choice
   to avoid altering already-complex failure control-flow at those sites,
   not a performance optimization.
+
+---
+
+### 4432. Project Exemptions for the Secret-Read Guard
+
+**Hook:** `gsd-secret-read-guard.js` (PreToolUse — Read, Grep, Bash)
+
+**Purpose:** Let a project name specific committed files that the secret-read guard should not block, such as a placeholder template whose name (`.env.production`) matches a protected pattern, without disarming the guard for every other `.env` file. Before this, the only lever was removing the hook's registration, which unprotected the whole tree and came back on every update.
+
+**Requirements:**
+- REQ-SECRET-EXEMPT-01: An unconfigured project MUST block exactly as before; the config is read only after a token has already been classified as a secret name.
+- REQ-SECRET-EXEMPT-02: An exemption MUST apply only to a path listed in `hooks.secret_read_exempt` that is committed in `HEAD` as a regular file (mode `100644`/`100755`) and is a regular file in the working tree. An unreadable or unsupported repository (SHA-256, a missing object, a corrupt pack) or a missing `HEAD` MUST leave the file blocked. The check reads `.git` directly — no subprocess, no timer — so the verdict depends only on the repository's bytes.
+- REQ-SECRET-EXEMPT-03: Read and Grep `path` MAY resolve a relative path against the session directory; Bash MUST honor an exemption only for an absolute path, because a relative shell word can name a different file after `cd`, in `find -name`, or through `xargs`, and only when every command on the line (after wrapper resolution) is one of `cat`, `head`, `tail`, `grep`, `egrep`, `fgrep`, `rg`, `wc`, `diff`, `cmp`, `sort`, `uniq`, `cut`, `nl` or `od`, with no `$( )`, backtick or `<( )` body; any other command withdraws the exemption for the whole line.
+- REQ-SECRET-EXEMPT-04: An exempt operand MUST NOT end the scan: another secret named in the same command is still refused.
+- REQ-SECRET-EXEMPT-05: `config-set` and the guard MUST accept and reject the same entries (absolute, `..`, empty, non-string and directory-shaped entries refused; `\` read as `/`; leading `./` dropped).
+
+**Why the committed-file rule:** agents routinely write `.planning/config.json`. If the list alone were enough, an agent steered by injected text could add `.env` to it and read real credentials. Real secret files are untracked and ignored; a committed file's contents are already in the repository's history, so exempting it exposes nothing the repository does not already hold.
+
+**Config:**
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `hooks.secret_read_exempt` | array of strings | `[]` | Repo-relative paths of committed files the guard lets agents read. Exact paths only — no globs. See [CONFIGURATION.md](CONFIGURATION.md) and [the how-to](how-to/let-agents-read-a-committed-env-template.md). |
+
+**Known limits:** a Grep `glob` is not widened (use `path`); Bash needs the absolute path; a file must be committed before its exemption applies; the guard vouches for the path, not for working-tree bytes that differ from `HEAD`; an agent with Bash can rewrite local repository state (force-add and commit, `update-ref`) to make a file committed, the same class as the interpreter one-liner gap, so this is a guardrail, not a sandbox; a file inside a submodule cannot be exempted (the submodule's `.git` file is not followed); only the root project config is read.
 
 ---
 
